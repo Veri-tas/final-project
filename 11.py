@@ -105,10 +105,11 @@ class GateItem(QGraphicsRectItem):
         # 鎖定狀態（若 locked=True 則不可移動）
         self.locked = False
 
+        # label: use a larger font for improved readability
         self.label = QGraphicsSimpleTextItem(self.gate_label_text(), self)
         font = QFont()
-        font.setPointSize(6)      # 你可以改成 16、18 再試試
-        font.setBold(True)         # 想要細一點就把這行拿掉
+        font.setPointSize(9)      # 提升字體大小
+        font.setBold(True)
         self.label.setFont(font)
         b = self.label.boundingRect()
         self.label.setPos((self.w - b.width()) / 2, (self.h - b.height()) / 2)
@@ -153,18 +154,112 @@ class GateItem(QGraphicsRectItem):
 
     # ---------- 繪製 ----------
     def paint(self, painter: QPainter, option, widget=None):
-        super().paint(painter, option, widget)
+        """
+        改成使用馬卡龍（馬卡龍色系）漸層與圓角外觀。
+        並在右下角顯示數字 0 / 1（表示該 gate 的「值」），取代先前用顏色深淺表示。
+        """
+        # 延遲 import 以免 top-level 變動太多
+        from PyQt5.QtGui import QLinearGradient, QColor, QPen, QFontMetricsF
 
-        painter.setBrush(Qt.black)
-        r = 4
-        # input pins
+        rect = self.rect()
+
+        # 馬卡龍色系 palette（可換成你提供的 hex）
+        palette = {
+            "IN": "#C8F7E1",
+            "OUT": "#FFF5BA",
+            "AND": "#D7EEFF",
+            "OR": "#FFDAB9",
+            "NOT": "#E8D5FF",
+            "DFF": "#FFD1DC",
+            "TFF": "#FFD1DC",
+            "CUSTOM": "#FBE8FF",
+        }
+
+        if self.gate_type in palette:
+            base_hex = palette[self.gate_type]
+        elif self.custom_def is not None:
+            base_hex = palette["CUSTOM"]
+        else:
+            base_hex = "#F3F4F6"  # fallback淡灰
+
+        base_col = QColor(base_hex)
+
+        # 改動：不再以 value 改變整體顏色深淺（使用固定馬卡龍漸層）
+        grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        grad.setColorAt(0.0, base_col.lighter(110))
+        grad.setColorAt(1.0, base_col.darker(105))
+
+        pen_color = QColor(90, 90, 90)
+        painter.setPen(QPen(pen_color, 1.6))
+        painter.setBrush(grad)
+
+        radius = 8.0
+        painter.drawRoundedRect(rect, radius, radius)
+
+        # 選取時用較明顯的邊框
+        if self.isSelected():
+            painter.setPen(QPen(QColor(80, 140, 140), 2.8))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), radius, radius)
+
+        # subtle inner stroke
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 0.8))
+        inner = rect.adjusted(2, 2, -2, -2)
+        painter.drawRoundedRect(inner, max(0, radius - 2), max(0, radius - 2))
+
+        # draw pins as circles with two-tone (外圈白、內圈深)
+        painter.setPen(QPen(QColor(70, 70, 70), 1.0))
+        pin_r = 6
         for i in range(self.input_count):
             p = self.get_input_pin_local_pos(i)
-            painter.drawEllipse(p, r, r)
-        # output pins
+            # outer
+            painter.setBrush(QColor(255, 255, 255))
+            painter.drawEllipse(p, pin_r, pin_r)
+            # inner
+            painter.setBrush(QColor(80, 80, 80))
+            painter.drawEllipse(p, pin_r - 2, pin_r - 2)
+
         for j in range(self.output_count):
             p = self.get_output_pin_local_pos(j)
-            painter.drawEllipse(p, r, r)
+            painter.setBrush(QColor(255, 255, 255))
+            painter.drawEllipse(p, pin_r, pin_r)
+            painter.setBrush(QColor(80, 80, 80))
+            painter.drawEllipse(p, pin_r - 2, pin_r - 2)
+
+        # label: 確保使用較大的字體並置中
+        try:
+            f = QFont()
+            f.setPointSize(9)
+            f.setBold(True)
+            self.label.setFont(f)
+            b = self.label.boundingRect()
+            self.label.setPos((self.w - b.width()) / 2, (self.h - b.height()) / 2)
+        except Exception:
+            pass
+
+        # ------------------------------
+        # 在右下角畫出 0 / 1（代表 gate 的值）
+        # 對於 IN/OUT：使用 self.value；其他 gate：使用 out_values[0]（若有）
+        # ------------------------------
+        if self.gate_type in ("IN", "OUT"):
+            v = self.value
+        else:
+            v = self.out_values[0] if self.output_count > 0 else False
+
+        digit = "1" if v else "0"
+        # small font for the digit
+        font_small = QFont()
+        font_small.setPointSize(8)
+        font_small.setBold(True)
+        painter.setFont(font_small)
+        fm = painter.fontMetrics()
+        w_text = fm.horizontalAdvance(digit)
+        h_text = fm.height()
+        margin_x = 6
+        margin_y = 4
+        x = rect.right() - margin_x - w_text
+        y = rect.bottom() - margin_y
+        painter.setPen(QPen(QColor(60, 60, 60), 1.0))
+        painter.drawText(int(x), int(y), digit)
 
     # ---------- 移動時更新 wire ----------
     def itemChange(self, change, value):
@@ -290,13 +385,7 @@ class GateItem(QGraphicsRectItem):
 
     # ---------- 顯示更新 ----------
     def update_display(self):
-        if self.gate_type in ("IN", "OUT"):
-            v = self.value
-        else:
-            v = self.out_values[0] if self.output_count > 0 else False
-
-        self.setBrush(QBrush(Qt.yellow if v else Qt.white))
-
+        # 改動：不再以 brush 顏色表示值（value）；顯示交由 paint 處理右下角數字
         self.label.setText(self.gate_label_text())
         b = self.label.boundingRect()
         self.label.setPos((self.w - b.width()) / 2, (self.h - b.height()) / 2)
@@ -557,6 +646,7 @@ class WireItem(QGraphicsPathItem):
             except Exception:
                 pass
             return
+
 
 
 # ============================================================
