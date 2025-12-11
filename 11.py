@@ -6,12 +6,18 @@ from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QGraphicsPathItem, QGraphicsSimpleTextItem,
     QGraphicsItem,
+    QGraphicsEllipseItem,
     QToolBar, QAction,
     QVBoxLayout, QHBoxLayout,
     QLabel, QSpinBox, QPushButton, QLineEdit, QMessageBox,QPlainTextEdit, QCheckBox
 )
 from PyQt5.QtGui import QBrush, QPen, QPainter, QPainterPath,QFont
-from PyQt5.QtCore import Qt, QPointF, QEvent
+from PyQt5.QtCore import Qt, QPointF, QEvent, QTimer
+
+# 簡單的模組層級剪貼簿（儲存最近一次 copy/cut 的 gate 資訊）
+GATE_CLIPBOARD = None
+# 拉線貼齊半徑（像素）
+SNAP_RADIUS = 14
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
@@ -96,6 +102,9 @@ class GateItem(QGraphicsRectItem):
             | QGraphicsItem.ItemSendsGeometryChanges
         )
 
+        # 鎖定狀態（若 locked=True 則不可移動）
+        self.locked = False
+
         self.label = QGraphicsSimpleTextItem(self.gate_label_text(), self)
         font = QFont()
         font.setPointSize(6)      # 你可以改成 16、18 再試試
@@ -129,7 +138,7 @@ class GateItem(QGraphicsRectItem):
     def get_output_pin_scene_pos(self, j: int = 0) -> QPointF:
         return self.mapToScene(self.get_output_pin_local_pos(j))
 
-    def hit_test_pin(self, scene_pos: QPointF, r: float = 8.0):
+    def hit_test_pin(self, scene_pos: QPointF, r: float = 12.0):
         # input pins
         for i in range(self.input_count):
             p = self.get_input_pin_scene_pos(i)
@@ -201,6 +210,84 @@ class GateItem(QGraphicsRectItem):
             self.update_display()
         super().mouseDoubleClickEvent(event)
 
+    # ---------- 右鍵選單（刪除） ----------
+    def contextMenuEvent(self, event):
+        from PyQt5.QtWidgets import QMenu
+        from PyQt5.QtGui import QCursor
+        global GATE_CLIPBOARD
+
+        menu = QMenu()
+        act_copy = menu.addAction("Copy")
+        act_cut = menu.addAction("Cut")
+        # Lock/Unlock
+        act_lock = menu.addAction("Lock Position" if not self.locked else "Unlock Position")
+        menu.addSeparator()
+        act_delete = menu.addAction("Delete")
+        # 使用全域游標位置顯示選單，並延遲實際刪除動作，避免在事件處理中立刻移除 item
+        chosen = menu.exec_(QCursor.pos())
+        if chosen == act_copy:
+            # 儲存到模組層級剪貼簿
+            GATE_CLIPBOARD = {
+                "gate_type": self.gate_type,
+                "input_count": self.input_count,
+                "output_count": self.output_count,
+                "param_name": self.param_name,
+                "value": self.value,
+            }
+            return
+        elif chosen == act_cut:
+            GATE_CLIPBOARD = {
+                "gate_type": self.gate_type,
+                "input_count": self.input_count,
+                "output_count": self.output_count,
+                "param_name": self.param_name,
+                "value": self.value,
+            }
+            def do_cut():
+                scene = self.scene()
+                for w in list(self.connected_wires):
+                    try:
+                        w.disconnect()
+                    except Exception:
+                        pass
+                    if w.scene() is not None:
+                        w.scene().removeItem(w)
+                if scene is not None:
+                    try:
+                        scene.removeItem(self)
+                    except Exception:
+                        pass
+            QTimer.singleShot(0, do_cut)
+            return
+        elif chosen == act_lock:
+            # toggle lock
+            self.locked = not self.locked
+            # 設定移動 flag
+            self.setFlag(QGraphicsItem.ItemIsMovable, not self.locked)
+            # 視覺提示
+            self.setOpacity(0.7 if self.locked else 1.0)
+            return
+        elif chosen == act_delete:
+            def do_delete():
+                scene = self.scene()
+                # 先斷開並移除所有連線
+                for w in list(self.connected_wires):
+                    try:
+                        w.disconnect()
+                    except Exception:
+                        pass
+                    if w.scene() is not None:
+                        w.scene().removeItem(w)
+
+                # 再從 scene 移除自己
+                if scene is not None:
+                    try:
+                        scene.removeItem(self)
+                    except Exception:
+                        pass
+
+            QTimer.singleShot(0, do_delete)
+
     # ---------- 顯示更新 ----------
     def update_display(self):
         if self.gate_type in ("IN", "OUT"):
@@ -247,6 +334,9 @@ class WireItem(QGraphicsPathItem):
         )
 
         self.start_gate.add_wire(self)
+        # wire name & label
+        self.name: str = ""
+        self.label_item: Optional[QGraphicsSimpleTextItem] = None
         self.update_path()
 
     def set_temp_end_pos(self, pos: QPointF):
@@ -269,6 +359,28 @@ class WireItem(QGraphicsPathItem):
             self.end_gate.connect_input(self.end_index, self)
         else:
             self.end_gate.connect_output(self.end_index, self)
+
+        # Ask for a name for this wire (optional)
+        try:
+            from PyQt5.QtWidgets import QInputDialog
+            parent_widget = None
+            try:
+                views = self.start_gate.scene().views()
+                parent_widget = views[0] if views else None
+            except Exception:
+                parent_widget = None
+            name, ok = QInputDialog.getText(parent_widget, "Wire Name", "Enter wire name (optional):")
+            if ok and name:
+                self.name = name
+                # create label item in scene
+                if self.label_item is None and self.start_gate.scene() is not None:
+                    self.label_item = QGraphicsSimpleTextItem(self.name)
+                    self.label_item.setZValue(0)
+                    self.start_gate.scene().addItem(self.label_item)
+                elif self.label_item is not None:
+                    self.label_item.setText(self.name)
+        except Exception:
+            pass
 
         self.update_path()
 
@@ -295,12 +407,156 @@ class WireItem(QGraphicsPathItem):
         path.moveTo(s)
         path.lineTo(e)
         self.setPath(path)
+        # update label position (put near midpoint)
+        if self.label_item is not None:
+            try:
+                mx = (s.x() + e.x()) / 2.0
+                my = (s.y() + e.y()) / 2.0
+                # offset a little
+                br = self.label_item.boundingRect()
+                self.label_item.setPos(mx - br.width() / 2, my - br.height() / 2 - 6)
+            except Exception:
+                pass
 
     def disconnect(self):
         if self.start_gate:
             self.start_gate.remove_wire(self)
         if self.end_gate:
             self.end_gate.remove_wire(self)
+        # remove label if any
+        if self.label_item is not None:
+            try:
+                if self.label_item.scene() is not None:
+                    self.label_item.scene().removeItem(self.label_item)
+            except Exception:
+                pass
+            self.label_item = None
+
+    def mouseDoubleClickEvent(self, event):
+        """雙擊線時彈出對話框讓使用者修改名稱"""
+        try:
+            from PyQt5.QtWidgets import QInputDialog
+            parent_widget = None
+            try:
+                sc = self.start_gate.scene() if self.start_gate is not None else None
+                views = sc.views() if sc is not None else []
+                parent_widget = views[0] if views else None
+            except Exception:
+                parent_widget = None
+
+            name, ok = QInputDialog.getText(parent_widget, "Rename Wire", "Enter wire name:", text=self.name)
+            if ok:
+                self.name = name
+                if self.label_item is None and self.start_gate is not None and self.start_gate.scene() is not None:
+                    self.label_item = QGraphicsSimpleTextItem(self.name)
+                    self.label_item.setZValue(0)
+                    self.start_gate.scene().addItem(self.label_item)
+                elif self.label_item is not None:
+                    self.label_item.setText(self.name)
+                self.update_path()
+        except Exception:
+            pass
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        # Provide right-click menu for wires: Delete (for selected items) and Rename
+        from PyQt5.QtWidgets import QMenu
+        from PyQt5.QtGui import QCursor
+
+        scene = self.scene()
+        selected = list(scene.selectedItems()) if scene is not None else []
+
+        menu = QMenu()
+        act_rename = menu.addAction("Rename")
+        menu.addSeparator()
+        act_delete = menu.addAction("Delete")
+
+        chosen = menu.exec_(QCursor.pos())
+        if chosen == act_rename:
+            # reuse double-click logic
+            try:
+                from PyQt5.QtWidgets import QInputDialog
+                parent_widget = None
+                try:
+                    views = scene.views() if scene is not None else []
+                    parent_widget = views[0] if views else None
+                except Exception:
+                    parent_widget = None
+                name, ok = QInputDialog.getText(parent_widget, "Rename Wire", "Enter wire name:", text=self.name)
+                if ok:
+                    self.name = name
+                    if self.label_item is None and scene is not None:
+                        self.label_item = QGraphicsSimpleTextItem(self.name)
+                        self.label_item.setZValue(0)
+                        scene.addItem(self.label_item)
+                    elif self.label_item is not None:
+                        self.label_item.setText(self.name)
+                    self.update_path()
+            except Exception:
+                pass
+            return
+
+        if chosen == act_delete:
+            # If multiple items selected, delete them all (consistent with view)
+            if selected:
+                for item in selected:
+                    if isinstance(item, WireItem):
+                        item.disconnect()
+                        try:
+                            if item.scene() is not None:
+                                item.scene().removeItem(item)
+                        except Exception:
+                            pass
+                    elif isinstance(item, GateItem):
+                        for w in list(item.connected_wires):
+                            try:
+                                w.disconnect()
+                            except Exception:
+                                pass
+                            try:
+                                if w.scene() is not None:
+                                    w.scene().removeItem(w)
+                            except Exception:
+                                pass
+                        try:
+                            if item.scene() is not None:
+                                item.scene().removeItem(item)
+                        except Exception:
+                            pass
+            else:
+                # delete only this wire
+                try:
+                    self.disconnect()
+                except Exception:
+                    pass
+                try:
+                    if self.scene() is not None:
+                        self.scene().removeItem(self)
+                except Exception:
+                    pass
+            # cleanup indicators on the view if present
+            try:
+                views = scene.views() if scene is not None else []
+                if views:
+                    view = views[0]
+                    if hasattr(view, 'hover_dots'):
+                        for d in list(getattr(view, 'hover_dots', [])):
+                            try:
+                                if d.scene() is not None:
+                                    d.scene().removeItem(d)
+                            except Exception:
+                                pass
+                        view.hover_dots = []
+                    if hasattr(view, 'snap_indicator') and view.snap_indicator is not None:
+                        try:
+                            if view.snap_indicator.scene() is not None:
+                                view.snap_indicator.scene().removeItem(view.snap_indicator)
+                        except Exception:
+                            pass
+                        view.snap_indicator = None
+            except Exception:
+                pass
+            return
 
 
 # ============================================================
@@ -316,6 +572,13 @@ class CircuitView(QGraphicsView):
 
         self.drawing_wire = False
         self.current_wire: Optional[WireItem] = None
+        # hover indicator for overlapping wires
+        self.hovered_wire: Optional[WireItem] = None
+        self.hover_dots: List[QGraphicsEllipseItem] = []
+        # snap indicator and target
+        self.snap_indicator: Optional[QGraphicsEllipseItem] = None
+        self.snap_target = None
+        self.hover_point: Optional[QPointF] = None
 
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
@@ -333,6 +596,38 @@ class CircuitView(QGraphicsView):
                         hit_gate = item
                         break
 
+            # 如果沒有精準點到 pin，但點在 gate 本體上，嘗試回退到最近的 output pin（或 input if no output）
+            if hit_gate is None:
+                for item in self.scene().items(scene_pos):
+                    if isinstance(item, GateItem):
+                        # 優先找 output pin
+                        best_kind = None
+                        best_idx = None
+                        best_dist = 1e9
+                        # 檢查 output pins
+                        for j in range(item.output_count):
+                            p = item.get_output_pin_scene_pos(j)
+                            d = (p - scene_pos).manhattanLength()
+                            if d < best_dist:
+                                best_dist = d
+                                best_kind = 'out'
+                                best_idx = j
+                        # 如果沒有 output 或 output 太遠，檢查 input pins
+                        for i_pin in range(item.input_count):
+                            p2 = item.get_input_pin_scene_pos(i_pin)
+                            d2 = (p2 - scene_pos).manhattanLength()
+                            if d2 < best_dist:
+                                best_dist = d2
+                                best_kind = 'in'
+                                best_idx = i_pin
+
+                        # 若最接近的 pin 在可接受範圍內（SNAP_RADIUS），就視為點到該 pin
+                        if best_kind is not None and best_dist <= SNAP_RADIUS:
+                            hit_gate = item
+                            hit_kind = best_kind
+                            hit_index = best_idx
+                            break
+
             if hit_gate is not None:
                 # 尚未在拉線：只允許從 output 開始拉
                 if not self.drawing_wire:
@@ -345,6 +640,14 @@ class CircuitView(QGraphicsView):
                         )
                         self.scene().addItem(self.current_wire)
                         self.current_wire.set_temp_end_pos(scene_pos)
+                        # clear hover dots when starting a new wire
+                        try:
+                            for d in list(self.hover_dots):
+                                if d.scene() is not None:
+                                    d.scene().removeItem(d)
+                        except Exception:
+                            pass
+                        self.hover_dots = []
                         return
                 else:
                     # 已在拉線：只允許接到 input
@@ -358,6 +661,14 @@ class CircuitView(QGraphicsView):
                             kind=hit_kind,
                             index=hit_index,
                         )
+                        # cleanup snap indicator if present
+                        try:
+                            if getattr(self, 'snap_indicator', None) is not None and self.snap_indicator.scene() is not None:
+                                self.snap_indicator.scene().removeItem(self.snap_indicator)
+                        except Exception:
+                            pass
+                        self.snap_indicator = None
+                        self.snap_target = None
                     else:
                         # 無效終點 -> 取消這條線
                         self.current_wire.disconnect()
@@ -365,22 +676,288 @@ class CircuitView(QGraphicsView):
 
                     self.drawing_wire = False
                     self.current_wire = None
+                    # clear hover dots when finishing/cancelling
+                    try:
+                        for d in list(self.hover_dots):
+                            if d.scene() is not None:
+                                d.scene().removeItem(d)
+                    except Exception:
+                        pass
+                    self.hover_dots = []
                     return
             else:
                 # 點在空白區，如果正在拉線就取消
                 if self.drawing_wire and self.current_wire is not None:
+                    # 如果有 snap target，將其視為接到該 pin
+                    if getattr(self, 'snap_target', None) is not None:
+                        tgt_gate, tgt_kind, tgt_idx = self.snap_target
+                        if tgt_gate is not self.current_wire.start_gate and tgt_kind == 'in':
+                            self.current_wire.finalize_connection(gate=tgt_gate, kind=tgt_kind, index=tgt_idx)
+                            # cleanup
+                            try:
+                                if self.snap_indicator is not None and self.snap_indicator.scene() is not None:
+                                    self.snap_indicator.scene().removeItem(self.snap_indicator)
+                            except Exception:
+                                pass
+                            self.snap_indicator = None
+                            self.drawing_wire = False
+                            self.current_wire = None
+                            # clear hover dots
+                            try:
+                                for d in list(self.hover_dots):
+                                    if d.scene() is not None:
+                                        d.scene().removeItem(d)
+                            except Exception:
+                                pass
+                            self.hover_dots = []
+                            return
+                    # 如果滑鼠點在空白，但有 hover_point（靠近既有線），則把連線終點視為連到該線，
+                    # 在該點建立一個 junction（小 GateItem），並把原本的線分割成兩段，最後把目前的線接到 junction。
+                    # 若靠近既有線，暫不自動切割；改為取消當前拉線（避免誤刪除），
+                    # 若需手動切割/接到既有線，請使用工具或按住 Shift（功能暫停）。
+                    # 否則取消這條線
                     self.current_wire.disconnect()
                     self.scene().removeItem(self.current_wire)
                     self.current_wire = None
                     self.drawing_wire = False
+                    try:
+                        for d in list(self.hover_dots):
+                            if d.scene() is not None:
+                                d.scene().removeItem(d)
+                    except Exception:
+                        pass
+                    self.hover_dots = []
+
+        # 如果點擊時沒有直接命中 pin，但有 snap 目標，視為接到該 pin
+        if event.button() == Qt.LeftButton and self.drawing_wire is False:
+            # normal behavior above already handled
+            pass
 
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self.drawing_wire and self.current_wire is not None:
             scene_pos = self.mapToScene(event.pos())
-            self.current_wire.set_temp_end_pos(scene_pos)
+            # 首先嘗試 snap 到附近的 pin，如果找到則把臨時終點設為該 pin
+            snap_found = False
+            snap_pos = None
+            snap_info = None
+            for item in self.scene().items():
+                if isinstance(item, GateItem) and item is not self.current_wire.start_gate:
+                    res = item.hit_test_pin(scene_pos, r=SNAP_RADIUS)
+                    if res is not None:
+                        kind, idx = res
+                        if kind == 'in':
+                            p = item.get_input_pin_scene_pos(idx)
+                        else:
+                            p = item.get_output_pin_scene_pos(idx)
+                        snap_found = True
+                        snap_pos = p
+                        snap_info = (item, kind, idx)
+                        break
+
+            if snap_found and snap_pos is not None:
+                self.current_wire.set_temp_end_pos(snap_pos)
+                self.snap_target = snap_info
+                # show snap indicator
+                try:
+                    if hasattr(self, 'snap_indicator') and self.snap_indicator is not None:
+                        if self.snap_indicator.scene() is None:
+                            self.scene().addItem(self.snap_indicator)
+                        self.snap_indicator.setRect(snap_pos.x()-6, snap_pos.y()-6, 12, 12)
+                    else:
+                        self.snap_indicator = QGraphicsEllipseItem(snap_pos.x()-6, snap_pos.y()-6, 12, 12)
+                        self.snap_indicator.setBrush(QBrush(Qt.green))
+                        self.snap_indicator.setOpacity(0.5)
+                        self.snap_indicator.setZValue(2)
+                        self.scene().addItem(self.snap_indicator)
+                except Exception:
+                    pass
+            else:
+                # 沒有 snap -> 使用滑鼠位置並移除 snap indicator
+                self.current_wire.set_temp_end_pos(scene_pos)
+                self.snap_target = None
+                try:
+                    if hasattr(self, 'snap_indicator') and self.snap_indicator is not None:
+                        if self.snap_indicator.scene() is not None:
+                            self.snap_indicator.scene().removeItem(self.snap_indicator)
+                        self.snap_indicator = None
+                except Exception:
+                    pass
+            # --- detect nearby existing wires and show dots when overlapping ---
+            # compute closest wire (exclude current_wire)
+            hovered = None
+            min_d = 1e9
+            for item in self.scene().items():
+                if isinstance(item, WireItem) and item is not self.current_wire:
+                    # only consider wires that have both ends
+                    if item.start_gate is None or item.end_gate is None:
+                        continue
+                    # compute segment points
+                    if item.start_kind == "out":
+                        s = item.start_gate.get_output_pin_scene_pos(item.start_index)
+                    else:
+                        s = item.start_gate.get_input_pin_scene_pos(item.start_index)
+                    if item.end_kind == "in":
+                        e = item.end_gate.get_input_pin_scene_pos(item.end_index)
+                    else:
+                        e = item.end_gate.get_output_pin_scene_pos(item.end_index)
+                    # distance from scene_pos to segment s-e
+                    px, py = scene_pos.x(), scene_pos.y()
+                    sx, sy = s.x(), s.y()
+                    ex, ey = e.x(), e.y()
+                    dx = ex - sx
+                    dy = ey - sy
+                    if dx == 0 and dy == 0:
+                        continue
+                    t = ((px - sx) * dx + (py - sy) * dy) / (dx * dx + dy * dy)
+                    t = max(0.0, min(1.0, t))
+                    cx = sx + t * dx
+                    cy = sy + t * dy
+                    dist2 = (px - cx) ** 2 + (py - cy) ** 2
+                    if dist2 < min_d:
+                        min_d = dist2
+                        hovered = item
+
+            THRESH_SQ = 12 ** 2
+            if hasattr(self, "hovered_wire") and getattr(self, "hovered_wire", None) is hovered:
+                pass
+            else:
+                # clear previous dots
+                if hasattr(self, "hover_dots"):
+                    for d in list(getattr(self, "hover_dots", [])):
+                        try:
+                            if d.scene() is not None:
+                                d.scene().removeItem(d)
+                        except Exception:
+                            pass
+                    self.hover_dots = []
+                self.hovered_wire = None
+
+            if hovered is not None and min_d <= THRESH_SQ:
+                # create dots along hovered.path
+                self.hovered_wire = hovered
+                self.hover_dots = []
+                try:
+                    if hovered.start_kind == "out":
+                        s = hovered.start_gate.get_output_pin_scene_pos(hovered.start_index)
+                    else:
+                        s = hovered.start_gate.get_input_pin_scene_pos(hovered.start_index)
+                    if hovered.end_kind == "in":
+                        e = hovered.end_gate.get_input_pin_scene_pos(hovered.end_index)
+                    else:
+                        e = hovered.end_gate.get_output_pin_scene_pos(hovered.end_index)
+                    # store closest point on segment for possible junction
+                    # compute projection again to get cx,cy
+                    px, py = scene_pos.x(), scene_pos.y()
+                    sx, sy = s.x(), s.y()
+                    ex, ey = e.x(), e.y()
+                    dx = ex - sx
+                    dy = ey - sy
+                    t = ((px - sx) * dx + (py - sy) * dy) / (dx * dx + dy * dy)
+                    t = max(0.0, min(1.0, t))
+                    cx = sx + t * dx
+                    cy = sy + t * dy
+                    self.hover_point = QPointF(cx, cy)
+                    # sample a few points
+                    n = 5
+                    for i in range(1, n):
+                        t = i / float(n)
+                        x = s.x() + (e.x() - s.x()) * t
+                        y = s.y() + (e.y() - s.y()) * t
+                        dot = QGraphicsEllipseItem(x - 3, y - 3, 6, 6)
+                        dot.setBrush(QBrush(Qt.black))
+                        dot.setZValue(0.1)
+                        self.scene().addItem(dot)
+                        self.hover_dots.append(dot)
+                except Exception:
+                    pass
+            else:
+                self.hover_point = None
+
         super().mouseMoveEvent(event)
+
+    def contextMenuEvent(self, event):
+        from PyQt5.QtWidgets import QMenu
+        global GATE_CLIPBOARD
+        scene_pos = self.mapToScene(event.pos())
+
+        # 如果目前有選取物件，優先顯示針對選取項目的選單（例如 Delete）
+        selected = list(self.scene().selectedItems())
+        if selected:
+            menu = QMenu()
+            act_delete = menu.addAction("Delete")
+            chosen = menu.exec_(event.globalPos())
+            if chosen == act_delete:
+                # 與 keyPressEvent 的刪除行為一致
+                for item in selected:
+                    if isinstance(item, WireItem):
+                        item.disconnect()
+                        try:
+                            if item.scene() is not None:
+                                item.scene().removeItem(item)
+                        except Exception:
+                            pass
+                    elif isinstance(item, GateItem):
+                        for w in list(item.connected_wires):
+                            try:
+                                w.disconnect()
+                            except Exception:
+                                pass
+                            try:
+                                if w.scene() is not None:
+                                    w.scene().removeItem(w)
+                            except Exception:
+                                pass
+                        try:
+                            if item.scene() is not None:
+                                item.scene().removeItem(item)
+                        except Exception:
+                            pass
+                # cleanup any hover/snap indicators
+                try:
+                    for d in list(getattr(self, 'hover_dots', [])):
+                        if d.scene() is not None:
+                            d.scene().removeItem(d)
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, 'snap_indicator', None) is not None and self.snap_indicator.scene() is not None:
+                        self.snap_indicator.scene().removeItem(self.snap_indicator)
+                except Exception:
+                    pass
+                self.hover_dots = []
+                self.snap_indicator = None
+            return
+
+        # 如果點到 gate，交給 gate 自己處理（讓 GateItem 處理其個別選單）
+        items = self.scene().items(scene_pos)
+        if any(isinstance(it, GateItem) for it in items):
+            super().contextMenuEvent(event)
+            return
+
+        # 空白處選單（Paste）
+        menu = QMenu()
+        act_paste = None
+        if GATE_CLIPBOARD is not None:
+            act_paste = menu.addAction("Paste")
+
+        chosen = menu.exec_(event.globalPos())
+        if chosen == act_paste and GATE_CLIPBOARD is not None:
+            data = GATE_CLIPBOARD.copy()
+            g = GateItem(
+                gate_type=data.get("gate_type", "AND"),
+                x=scene_pos.x() - 20,
+                y=scene_pos.y() - 10,
+                input_count=data.get("input_count"),
+                output_count=data.get("output_count"),
+            )
+            g.param_name = data.get("param_name")
+            g.value = data.get("value", False)
+            for k in range(g.output_count):
+                g.out_values[k] = g.value
+            g.update_display()
+            self.scene().addItem(g)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
@@ -705,6 +1282,9 @@ class MainWindow(QMainWindow):
         self.main_editor.add_gate("IN", x=50, y=220)
         self.main_editor.add_gate("OUT", x=600, y=180)
 
+        # 啟動後把 view 置中到現有的 items（用 singleShot 延遲到事件循環）
+        QTimer.singleShot(0, self._center_view_on_items)
+
         # Toolbar
         self.toolbar = QToolBar("Main Toolbar", self)
         self.addToolBar(self.toolbar)
@@ -798,6 +1378,21 @@ class MainWindow(QMainWindow):
             self.input_list_layout.addWidget(row)
 
         self.input_list_layout.addStretch()
+
+    def _center_view_on_items(self):
+        try:
+            br = self.main_editor.scene.itemsBoundingRect()
+            if br.isNull() or (br.width() == 0 and br.height() == 0):
+                return
+            # 將 view 置中到 items 的中心，並確保可見範圍
+            self.main_editor.view.centerOn(br.center())
+            try:
+                # 加入 margin，確保能看到周圍空間
+                self.main_editor.view.ensureVisible(br, 50, 50)
+            except Exception:
+                pass
+        except Exception:
+            pass
     def plot_flow_waveforms(self):
         """
         開一個視窗，用目前 self.flow_history 畫 timing diagram。
